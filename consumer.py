@@ -16,7 +16,8 @@ import os
 import threading
 from datetime import datetime
 
-from confluent_kafka import DeserializingConsumer, SerializingProducer, KafkaError
+from confluent_kafka import DeserializingConsumer, SerializingProducer, KafkaError, KafkaException
+from confluent_kafka.error import ConsumeError
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer, AvroSerializer
 from confluent_kafka.serialization import StringDeserializer, StringSerializer
@@ -167,16 +168,23 @@ def main():
 
     try:
         while True:
-            msg = consumer.poll(timeout=POLL_TIMEOUT)
-
-            if msg is None:
+            # DeserializingConsumer.poll() raises ConsumeError on broker/deserialization
+            # errors instead of returning a Message with .error() set (unlike the plain
+            # Consumer API) — so those errors must be caught here, not checked via msg.error().
+            try:
+                msg = consumer.poll(timeout=POLL_TIMEOUT)
+            except ConsumeError as e:
+                if e.code == KafkaError._PARTITION_EOF:
+                    print(f"{CYAN}  ⏸  End of partition reached{RESET}")
+                elif e.code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    # Topic not created yet (auto.create.topics.enable is still propagating)
+                    print(f"{YELLOW}  ⏳  Topic '{TOPIC}' not available yet — waiting for auto-creation…{RESET}")
+                    time.sleep(1)
+                else:
+                    print(f"{RED}  ✖  Kafka error: {e}{RESET}")
                 continue
 
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    print(f"{CYAN}  ⏸  End of partition reached{RESET}")
-                else:
-                    print(f"{RED}  ✖  Kafka error: {msg.error()}{RESET}")
+            if msg is None:
                 continue
 
             order = msg.value()
@@ -188,7 +196,16 @@ def main():
                   f"  [partition={msg.partition()} offset={msg.offset()}]{RESET}")
 
             process_with_retry(order)
-            consumer.commit(asynchronous=False)  # commit only after processing
+            try:
+                consumer.commit(asynchronous=False)  # commit only after processing
+            except KafkaException as e:
+                # A broker-side hiccup (e.g. a transient network stall) can knock the
+                # consumer out of its group before the commit lands, surfacing as
+                # UNKNOWN_MEMBER_ID / REBALANCE_IN_PROGRESS. That message was still
+                # processed above; don't crash the whole consumer over a lost commit —
+                # log it and keep going (the next successful commit will catch up, and
+                # a rejoined-but-stale offset only risks a harmless reprocess, not loss).
+                print(f"{RED}  ✖  [{ts()}] COMMIT FAILED for orderId={order['orderId']}: {e}{RESET}")
 
     except KeyboardInterrupt:
         banner("🛑  Consumer interrupted — shutting down", YELLOW)

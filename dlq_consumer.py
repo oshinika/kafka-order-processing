@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 
 from confluent_kafka import DeserializingConsumer, KafkaError
+from confluent_kafka.error import ConsumeError
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer
@@ -68,16 +69,20 @@ def main():
 
     try:
         while True:
-            msg = consumer.poll(timeout=POLL_TIMEOUT)
-
-            if msg is None:
+            # DeserializingConsumer.poll() raises ConsumeError on broker/deserialization
+            # errors instead of returning a Message with .error() set — must be caught here.
+            try:
+                msg = consumer.poll(timeout=POLL_TIMEOUT)
+            except ConsumeError as e:
+                if e.code == KafkaError._PARTITION_EOF:
+                    print(f"{CYAN}  ⏸  End of DLQ partition reached{RESET}")
+                elif e.code == KafkaError.UNKNOWN_TOPIC_OR_PART:
+                    print(f"{YELLOW}  ⏳  Topic '{DLQ_TOPIC}' not available yet — waiting for auto-creation…{RESET}")
+                else:
+                    print(f"{RED}  ✖  Kafka error: {e}{RESET}")
                 continue
 
-            if msg.error():
-                if msg.error().code() == KafkaError._PARTITION_EOF:
-                    print(f"{CYAN}  ⏸  End of DLQ partition reached{RESET}")
-                else:
-                    print(f"{RED}  ✖  Kafka error: {msg.error()}{RESET}")
+            if msg is None:
                 continue
 
             dlq_count += 1
